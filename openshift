@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 #
 # openshift - Interactive CLI wizard for managing OpenShift (oc) authentications and contexts.
+# WIZARD_MARKER: openshift-cli-wizard
+#   (Stable identifying tag used by uninstall_self()/uninstall.sh to safely
+#   recognize a file installed by this project -- installs are a standalone
+#   copy, not a symlink, so this marker is how we confirm it's ours before
+#   deleting it, without relying on any relationship to this source repo.)
 #
 # Purpose:
 #   Helper tool for QA Automation teams to easily log into corporate OpenShift
@@ -25,6 +30,14 @@ set -uo pipefail
 
 readonly SCRIPT_NAME="openshift"
 readonly SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+
+# Stable tag embedded near the top of this file (see the header comment
+# above). install_self() installs a standalone *copy* of this script, not
+# a symlink, so the repo can be safely deleted/moved after installing.
+# uninstall_self() greps installed files for this marker to confirm a file
+# is actually an openshift-cli-wizard install before removing it, since it
+# can no longer rely on symlink-target comparison to prove that.
+readonly WIZARD_MARKER="WIZARD_MARKER: openshift-cli-wizard"
 
 readonly DEV_LOGIN_URL="https://oauth-openshift.apps.ocd.cc.corp/oauth/token/display"
 readonly PROD_LOGIN_URL="https://oauth-openshift.apps.ocp.cc.corp/oauth/token/display"
@@ -610,14 +623,19 @@ install_self() {
 
   chmod +x "$SCRIPT_PATH" 2>/dev/null || true
 
+  # Install a standalone *copy* (not a symlink): once installed, the
+  # command keeps working even if this repo is later moved or deleted.
+  # The trade-off is that future changes to the repo's script require
+  # rerunning this installer to pick them up.
   if [[ -w "$target_dir" ]]; then
-    ln -sf "$SCRIPT_PATH" "$target_path"
+    cp "$SCRIPT_PATH" "$target_path"
   else
     info "Elevated permissions required to write to $target_dir"
-    sudo ln -sf "$SCRIPT_PATH" "$target_path"
+    sudo cp "$SCRIPT_PATH" "$target_path"
   fi
+  chmod +x "$target_path" 2>/dev/null || true
 
-  success "Installed: $target_path -> $SCRIPT_PATH"
+  success "Installed: $target_path (standalone copy of $SCRIPT_PATH)"
 
   case ":$PATH:" in
     *":$target_dir:"*)
@@ -631,29 +649,43 @@ install_self() {
   esac
 }
 
-# Removes any symlink previously created by install_self(), but only if it
-# actually points back at this script. Never touches unrelated files, the
-# oc kubeconfig, or any oc contexts.
+# Removes any copy previously created by install_self(), but only if the
+# installed file actually looks like an openshift-cli-wizard install (it
+# contains our stable marker comment). This means uninstall works
+# correctly regardless of whether the repo that originally installed it
+# still exists -- unlike a symlink-based install, there's no path back to
+# this repo to compare against. Never touches unrelated files, the oc
+# kubeconfig, or any oc contexts.
 uninstall_self() {
   heading "Uninstalling $SCRIPT_NAME"
 
   local candidate_dirs=("$HOME/.local/bin" "/usr/local/bin")
   local removed_any=0
-  local dir candidate link_target
+  local dir candidate
 
   for dir in "${candidate_dirs[@]}"; do
     candidate="$dir/$SCRIPT_NAME"
 
-    [[ -e "$candidate" || -L "$candidate" ]] || continue
-
-    if [[ -L "$candidate" ]]; then
-      link_target="$(readlink "$candidate")"
-      if [[ "$link_target" != "$SCRIPT_PATH" ]]; then
-        warn "Skipping $candidate: it does not point to this repo's '$SCRIPT_NAME' script (points to '$link_target')."
-        continue
+    # A dangling symlink left over from an older, symlink-based install
+    # (e.g. the repo it pointed to was deleted) fails both -e and content
+    # checks below, so handle it explicitly first.
+    if [[ -L "$candidate" && ! -e "$candidate" ]]; then
+      warn "Found a broken symlink at $candidate (likely from an older install); removing it."
+      if [[ -w "$dir" ]]; then
+        rm -f "$candidate"
+      else
+        info "Elevated permissions required to remove $candidate"
+        sudo rm -f "$candidate"
       fi
-    else
-      warn "Skipping $candidate: it is a regular file, not a symlink created by this installer."
+      success "Removed: $candidate"
+      removed_any=1
+      continue
+    fi
+
+    [[ -e "$candidate" ]] || continue
+
+    if ! grep -q "$WIZARD_MARKER" "$candidate" 2>/dev/null; then
+      warn "Skipping $candidate: it doesn't look like an openshift-cli-wizard installation."
       continue
     fi
 
@@ -669,7 +701,7 @@ uninstall_self() {
   done
 
   if [[ "$removed_any" -eq 0 ]]; then
-    warn "Nothing to uninstall: no '$SCRIPT_NAME' wizard symlink found in ${candidate_dirs[*]}."
+    warn "Nothing to uninstall: no '$SCRIPT_NAME' wizard install found in ${candidate_dirs[*]}."
   else
     info "Uninstall complete. The repository files themselves were left untouched."
   fi

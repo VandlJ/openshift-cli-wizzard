@@ -2,9 +2,11 @@
 #
 # install.sh - Installer for the `openshift` CLI wizard.
 #
-# Symlinks the `openshift` script into a directory on the user's PATH,
+# Copies the `openshift` script into a directory on the user's PATH,
 # preferring ~/.local/bin and falling back to /usr/local/bin (which may
-# require sudo).
+# require sudo). Installs a standalone copy (not a symlink), so this repo
+# can be safely moved or deleted afterward -- rerun this script to pick up
+# future changes to the source script.
 #
 set -euo pipefail
 
@@ -57,13 +59,14 @@ fi
 target_path="$target_dir/$BIN_NAME"
 
 if [[ -w "$target_dir" ]]; then
-  ln -sf "$SOURCE_PATH" "$target_path"
+  cp "$SOURCE_PATH" "$target_path"
 else
   info "Elevated permissions required to write to $target_dir"
-  sudo ln -sf "$SOURCE_PATH" "$target_path"
+  sudo cp "$SOURCE_PATH" "$target_path"
 fi
+chmod +x "$target_path" 2>/dev/null || true
 
-success "Installed: $target_path -> $SOURCE_PATH"
+success "Installed: $target_path (standalone copy of $SOURCE_PATH)"
 
 case ":$PATH:" in
   *":$target_dir:"*)

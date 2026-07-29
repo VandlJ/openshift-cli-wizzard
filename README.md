@@ -40,8 +40,10 @@ Two equivalent ways to install:
 
 Both approaches:
 - Make `openshift` executable.
-- Symlink it into `~/.local/bin/openshift` (preferred) or
-  `/usr/local/bin/openshift` (fallback, may prompt for `sudo`).
+- Install a standalone **copy** into `~/.local/bin/openshift` (preferred) or
+  `/usr/local/bin/openshift` (fallback, may prompt for `sudo`) -- not a
+  symlink, so this repo can be safely moved or deleted afterward. Rerun
+  the installer to pick up future changes to the script.
 - Warn you if the chosen directory isn't on your `PATH` yet, with the
   exact line to add to your shell profile.
 
@@ -129,8 +131,10 @@ or
 openshift --uninstall
 ```
 
-Both only remove the symlink(s) created by the installer (checked in both
+Both only remove the file(s) created by the installer (checked in both
 `~/.local/bin/openshift` and `/usr/local/bin/openshift`), and only if the
-symlink actually points back at this repo's `openshift` script. Nothing
-else on your system is touched — no oc kubeconfig entries, no contexts,
-no other files are modified or deleted.
+file is actually recognized as an openshift-cli-wizard install (it
+contains a stable marker comment). This works even if the repo that
+originally installed it no longer exists. Nothing else on your system is
+touched — no oc kubeconfig entries, no contexts, no other files are
+modified or deleted.

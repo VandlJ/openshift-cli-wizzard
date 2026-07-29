@@ -3,15 +3,15 @@
 # uninstall.sh - Removes the `openshift` CLI wizard from this machine.
 #
 # Only removes files that were installed by install.sh / `openshift --install`
-# (i.e. symlinks pointing back at this repo's `openshift` script). It never
-# touches unrelated files, your oc kubeconfig, or any oc contexts.
+# (identified by a stable marker comment embedded in the script, since
+# installs are a standalone copy rather than a symlink). It never touches
+# unrelated files, your oc kubeconfig, or any oc contexts.
 #
 set -euo pipefail
 
-readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-readonly SOURCE_PATH="$SCRIPT_DIR/openshift"
 readonly BIN_NAME="openshift"
 readonly CANDIDATE_DIRS=("$HOME/.local/bin" "/usr/local/bin")
+readonly WIZARD_MARKER="WIZARD_MARKER: openshift-cli-wizard"
 
 # Brand color palette (green heading, blue info, teal success, pink warn),
 # with a safe fallback when not a TTY. Mirrors the main `openshift` script's
@@ -45,20 +45,29 @@ removed_any=0
 for dir in "${CANDIDATE_DIRS[@]}"; do
   candidate="$dir/$BIN_NAME"
 
-  # Only act on this path if it actually exists.
-  [[ -e "$candidate" || -L "$candidate" ]] || continue
-
-  # Safety check: only remove it if it's a symlink pointing at *our* script.
-  # This avoids deleting an unrelated file some other tool may have placed
-  # at the same path.
-  if [[ -L "$candidate" ]]; then
-    link_target="$(readlink "$candidate")"
-    if [[ "$link_target" != "$SOURCE_PATH" ]]; then
-      warn "Skipping $candidate: it does not point to this repo's 'openshift' script (points to '$link_target')."
-      continue
+  # A dangling symlink left over from an older, symlink-based install
+  # (e.g. the repo it pointed to was deleted) fails both -e and content
+  # checks below, so handle it explicitly first.
+  if [[ -L "$candidate" && ! -e "$candidate" ]]; then
+    warn "Found a broken symlink at $candidate (likely from an older install); removing it."
+    if [[ -w "$dir" ]]; then
+      rm -f "$candidate"
+    else
+      info "Elevated permissions required to remove $candidate"
+      sudo rm -f "$candidate"
     fi
-  else
-    warn "Skipping $candidate: it is a regular file, not a symlink created by this installer."
+    success "Removed: $candidate"
+    removed_any=1
+    continue
+  fi
+
+  [[ -e "$candidate" ]] || continue
+
+  # Safety check: only remove it if it actually looks like an
+  # openshift-cli-wizard install. This avoids deleting an unrelated file
+  # some other tool may have placed at the same path.
+  if ! grep -q "$WIZARD_MARKER" "$candidate" 2>/dev/null; then
+    warn "Skipping $candidate: it doesn't look like an openshift-cli-wizard installation."
     continue
   fi
 
@@ -74,7 +83,7 @@ for dir in "${CANDIDATE_DIRS[@]}"; do
 done
 
 if [[ "$removed_any" -eq 0 ]]; then
-  warn "Nothing to uninstall: no 'openshift' wizard symlink found in ${CANDIDATE_DIRS[*]}."
+  warn "Nothing to uninstall: no 'openshift' wizard install found in ${CANDIDATE_DIRS[*]}."
 else
   info "Uninstall complete. The repository files themselves were left untouched."
 fi
