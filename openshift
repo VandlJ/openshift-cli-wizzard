@@ -1,0 +1,625 @@
+#!/usr/bin/env bash
+#
+# openshift - Interactive CLI wizard for managing OpenShift (oc) authentications and contexts.
+#
+# Purpose:
+#   Helper tool for QA Automation teams to easily log into corporate OpenShift
+#   environments, switch contexts, and manage configurations without having to
+#   remember long `oc` commands.
+#
+# Design notes:
+#   - Pure Bash + POSIX utilities only (no external UI libraries like gum).
+#   - Modular: one function per responsibility, dispatched from a main menu.
+#   - Strict error handling with explicit guards around risky external calls,
+#     so a single failure never crashes the whole wizard.
+#
+set -uo pipefail
+# NOTE: `set -e` is intentionally NOT enabled globally. This script runs an
+# interactive menu loop; a single failed `oc` command should be reported and
+# handled gracefully, not terminate the whole process. Each function that
+# calls an external command checks its own exit status explicitly instead.
+
+# --------------------------------------------------------------------------
+# Constants
+# --------------------------------------------------------------------------
+
+readonly SCRIPT_NAME="openshift"
+readonly SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+
+readonly DEV_LOGIN_URL="https://oauth-openshift.apps.ocd.cc.corp/oauth/token/display"
+readonly PROD_LOGIN_URL="https://oauth-openshift.apps.ocp.cc.corp/oauth/token/display"
+
+# Populated by check_prereqs()
+OPEN_CMD=""
+
+# Populated by interactive_menu() while it has the terminal in raw mode, so
+# the global Ctrl+C trap can restore it if the user bails out mid-menu.
+SAVED_STTY=""
+
+# --------------------------------------------------------------------------
+# UI helpers (brand color palette, with a safe fallback when not a TTY)
+# --------------------------------------------------------------------------
+#
+# Palette (from brand guidelines):
+#   Brand green  #006633  -> headings / selected-item highlight
+#   Blue         #00A7E1  -> info / prompts
+#   Teal         #16E0BD  -> success
+#   Pink         #F65CA2  -> warnings
+#   Orange       #F24F00  -> errors
+#
+# True 24-bit color is used when the terminal advertises support via
+# COLORTERM; otherwise we fall back to the closest portable 8-color
+# equivalents via tput so the wizard still looks reasonable everywhere.
+
+if [[ -t 1 ]] && command -v tput >/dev/null 2>&1 && [[ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]]; then
+  if [[ "${COLORTERM:-}" == "truecolor" || "${COLORTERM:-}" == "24bit" ]]; then
+    COLOR_BRAND="$(printf '\033[38;2;0;102;51m')"    # #006633
+    COLOR_INFO="$(printf '\033[38;2;0;167;225m')"    # #00A7E1
+    COLOR_SUCCESS="$(printf '\033[38;2;22;224;189m')" # #16E0BD
+    COLOR_WARN="$(printf '\033[38;2;246;92;162m')"    # #F65CA2
+    COLOR_ERROR="$(printf '\033[38;2;242;79;0m')"     # #F24F00
+  else
+    COLOR_BRAND="$(tput setaf 2)"   # green
+    COLOR_INFO="$(tput setaf 4)"    # blue
+    COLOR_SUCCESS="$(tput setaf 6)" # cyan (closest to teal)
+    COLOR_WARN="$(tput setaf 5)"    # magenta (closest to pink)
+    COLOR_ERROR="$(tput setaf 1)"   # red (closest to orange)
+  fi
+  COLOR_BOLD="$(tput bold)"
+  COLOR_RESET="$(tput sgr0)"
+else
+  COLOR_BRAND=""
+  COLOR_INFO=""
+  COLOR_SUCCESS=""
+  COLOR_WARN=""
+  COLOR_ERROR=""
+  COLOR_BOLD=""
+  COLOR_RESET=""
+fi
+
+info()    { printf '%s%s%s\n' "${COLOR_INFO}" "$*" "${COLOR_RESET}"; }
+success() { printf '%s%s%s\n' "${COLOR_SUCCESS}" "$*" "${COLOR_RESET}"; }
+warn()    { printf '%s%s%s\n' "${COLOR_WARN}" "$*" "${COLOR_RESET}"; }
+error()   { printf '%s%s%s\n' "${COLOR_ERROR}" "$*" "${COLOR_RESET}" >&2; }
+heading() { printf '\n%s%s%s\n' "${COLOR_BOLD}${COLOR_BRAND}" "$*" "${COLOR_RESET}"; }
+
+
+# --------------------------------------------------------------------------
+# Prerequisite checks
+# --------------------------------------------------------------------------
+
+check_prereqs() {
+  local missing=0
+
+  if ! command -v oc >/dev/null 2>&1; then
+    error "Error: the 'oc' CLI is not installed or not on your PATH."
+    error "Install it from https://docs.openshift.com/container-platform/latest/cli_reference/openshift_cli/getting-started-cli.html"
+    missing=1
+  fi
+
+  if command -v open >/dev/null 2>&1; then
+    OPEN_CMD="open"
+  elif command -v xdg-open >/dev/null 2>&1; then
+    OPEN_CMD="xdg-open"
+  else
+    error "Error: no browser-opening utility found (need 'open' on macOS or 'xdg-open' on Linux)."
+    missing=1
+  fi
+
+  if [[ "$missing" -ne 0 ]]; then
+    error "Please install the missing prerequisite(s) above and try again."
+    exit 1
+  fi
+}
+
+# --------------------------------------------------------------------------
+# Context helpers
+# --------------------------------------------------------------------------
+
+# Populates the global array CONTEXTS with all known oc context names.
+# Returns 1 (and prints a warning) if none are found.
+load_contexts() {
+  local raw
+  if ! raw="$(oc config get-contexts -o name 2>/dev/null)"; then
+    error "Failed to read contexts. Is your kubeconfig accessible?"
+    return 1
+  fi
+
+  CONTEXTS=()
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && CONTEXTS+=("$line")
+  done <<< "$raw"
+
+  if [[ "${#CONTEXTS[@]}" -eq 0 ]]; then
+    warn "No contexts found in your kubeconfig yet. Try 'Login' first."
+    return 1
+  fi
+
+  return 0
+}
+
+# Generic interactive picker with arrow-key navigation. Renders the given
+# title and list of options, highlights the current selection, and lets the
+# user move with Up/Down arrows. Enter or Space confirms; 'q', Esc, or
+# Ctrl+C cancels. The chosen 0-based index is stored in the global
+# MENU_SELECTED_INDEX. Returns 1 if the user cancels.
+#
+# No external dependencies: relies only on `read -n` for raw key capture and
+# `tput` for cursor movement, both of which are portable across macOS/Linux.
+interactive_menu() {
+  local title="$1"
+  shift
+  local options=("$@")
+  local count="${#options[@]}"
+  local selected=0
+  local key key2
+  local lines_printed=0
+
+  MENU_SELECTED_INDEX=-1
+
+  if [[ "$count" -eq 0 ]]; then
+    warn "Nothing to select from."
+    return 1
+  fi
+
+  # Prints one line, clearing any leftover text from a previous (longer)
+  # render at the same position, and tracks how many lines were drawn so
+  # the caller can move the cursor back up before redrawing.
+  _menu_draw_line() {
+    printf '\r'
+    tput el 2>/dev/null
+    printf '%s\n' "$1"
+    (( lines_printed++ ))
+  }
+
+  _menu_render() {
+    lines_printed=0
+    _menu_draw_line "${COLOR_BOLD}${COLOR_BRAND}${title}${COLOR_RESET}"
+    local i
+    for i in "${!options[@]}"; do
+      if [[ "$i" -eq "$selected" ]]; then
+        _menu_draw_line "  ${COLOR_BRAND}${COLOR_BOLD}> ${options[$i]}${COLOR_RESET}"
+      else
+        _menu_draw_line "    ${options[$i]}"
+      fi
+    done
+    _menu_draw_line "${COLOR_INFO}(Up/Down or Left/Right to move, Enter/Space/Right to select, q/Esc/Left to cancel)${COLOR_RESET}"
+  }
+
+  tput civis 2>/dev/null
+
+  # Put the terminal into raw, no-echo mode for the *entire* menu session
+  # (not per-keystroke). This matters: bash's `read -n1` normally saves the
+  # terminal settings, flips to raw mode, reads one character, and restores
+  # the original settings again -- every single call. If the remaining
+  # bytes of a multi-byte arrow-key escape sequence happen to arrive in the
+  # tiny gap between two such calls, the kernel's line discipline (back in
+  # canonical mode during that gap) buffers them waiting for a newline that
+  # never comes, and no amount of polling afterward can recover them. By
+  # setting raw/no-echo mode once up front and restoring it once at the
+  # end, that gap never exists, so multi-byte sequences are always read
+  # atomically regardless of any per-call scheduling jitter.
+  SAVED_STTY="$(stty -g 2>/dev/null || true)"
+  stty -icanon -echo 2>/dev/null || true
+
+  _menu_render
+
+  while true; do
+    if ! IFS= read -rsn1 key; then
+      # EOF or unreadable input (e.g. stdin is closed/non-interactive):
+      # treat exactly like a cancel instead of spinning forever.
+      break
+    fi
+
+    # Arrow keys arrive as a 3-byte escape sequence: ESC [ A|B|C|D. A lone
+    # Esc keypress has no more bytes waiting and times out below, which is
+    # treated as a cancel.
+    #
+    # This lookahead read is deliberately wrapped in a subshell (command
+    # substitution). bash 3.2 (macOS's default /bin/bash) has a real bug
+    # where a positive `read -t N` timeout never fires when the read
+    # happens directly inside a shell function -- it just blocks forever.
+    # The same `read -t N` works correctly when run inside a subshell, so
+    # that's the fix: run it there and capture its output instead.
+    # (A zero-timeout `read -t 0` poll was tried first as a non-blocking
+    # alternative, but it unreliably reports "no data" even when a
+    # blocking read on the same fd would return instantly, so it can't be
+    # used to distinguish a lone Esc from an arrow key either.)
+    if [[ "$key" == $'\x1b' ]]; then
+      key2="$(IFS= read -rsn2 -t 1 _lookahead 2>/dev/null; printf '%s' "$_lookahead")"
+      key+="$key2"
+    fi
+
+    case "$key" in
+      $'\x1b[A') # Up arrow
+        selected=$(( (selected - 1 + count) % count ))
+        ;;
+      $'\x1b[B') # Down arrow
+        selected=$(( (selected + 1) % count ))
+        ;;
+      $'\x1b[C') # Right arrow confirms (acts as "continue")
+        MENU_SELECTED_INDEX="$selected"
+        break
+        ;;
+      $'\x1b[D') # Left arrow cancels (acts as "back")
+        break
+        ;;
+      ""|" "|$'\r') # Enter, Space, or a raw carriage return confirms
+        MENU_SELECTED_INDEX="$selected"
+        break
+        ;;
+      "q"|"Q"|$'\x1b') # q, Q, or a lone Esc cancels
+        break
+        ;;
+      *)
+        : # ignore any other key
+        ;;
+    esac
+
+    tput cuu "$lines_printed" 2>/dev/null
+    _menu_render
+  done
+
+  # Restore the terminal to whatever state it was in before this menu
+  # took over, and show the cursor again.
+  if [[ -n "$SAVED_STTY" ]]; then
+    stty "$SAVED_STTY" 2>/dev/null || true
+  fi
+  tput cnorm 2>/dev/null
+
+  [[ "$MENU_SELECTED_INDEX" -ge 0 ]]
+}
+
+# --------------------------------------------------------------------------
+# Feature: Switch Environment (select context)
+# --------------------------------------------------------------------------
+
+switch_context() {
+  load_contexts || return 0
+
+  interactive_menu "Switch Environment - select a context:" "${CONTEXTS[@]}" || { warn "Cancelled."; return 0; }
+  local target="${CONTEXTS[$MENU_SELECTED_INDEX]}"
+
+  if oc config use-context "$target" >/dev/null 2>&1; then
+    success "Switched to context: $target"
+  else
+    error "Failed to switch to context: $target"
+  fi
+}
+
+# --------------------------------------------------------------------------
+# Feature: Switch Project (select namespace)
+# --------------------------------------------------------------------------
+
+switch_project() {
+  local raw
+  if ! raw="$(oc get projects -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null)"; then
+    error "Failed to fetch projects. Are you logged in and connected to a cluster?"
+    return 0
+  fi
+
+  local projects=()
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && projects+=("$line")
+  done <<< "$raw"
+
+  if [[ "${#projects[@]}" -eq 0 ]]; then
+    warn "No accessible projects found for the current context."
+    return 0
+  fi
+
+  interactive_menu "Switch Project - select a namespace:" "${projects[@]}" || { warn "Cancelled."; return 0; }
+  local target="${projects[$MENU_SELECTED_INDEX]}"
+
+  if oc project "$target" >/dev/null 2>&1; then
+    local current_ctx
+    current_ctx="$(oc config current-context 2>/dev/null || echo "unknown")"
+    success "Switched to project '$target' on context '$current_ctx'."
+  else
+    error "Failed to switch to project: $target"
+  fi
+}
+
+# --------------------------------------------------------------------------
+# Feature: Login (fetch new token & setup)
+# --------------------------------------------------------------------------
+
+login_flow() {
+  local env_choice url short_name
+  interactive_menu "Login - choose an environment:" "DEV" "PROD" || { warn "Cancelled."; return 0; }
+
+  case "$MENU_SELECTED_INDEX" in
+    0)
+      url="$DEV_LOGIN_URL"
+      short_name="dev"
+      ;;
+    1)
+      url="$PROD_LOGIN_URL"
+      short_name="prod"
+      ;;
+    *)
+      error "Unexpected selection index: $MENU_SELECTED_INDEX"
+      return 0
+      ;;
+  esac
+
+  info "Opening token page in your browser: $url"
+  if ! "$OPEN_CMD" "$url" >/dev/null 2>&1; then
+    warn "Could not open the browser automatically. Please open this URL manually:"
+    warn "  $url"
+  fi
+
+  echo
+  info "Please paste the 'oc login ...' command from the browser and press Enter:"
+  local pasted_cmd
+  read -r -p "> " pasted_cmd
+
+  if [[ -z "$pasted_cmd" ]]; then
+    warn "No command entered. Aborting login."
+    return 0
+  fi
+
+  if [[ "$pasted_cmd" != oc\ login* ]]; then
+    error "That doesn't look like an 'oc login ...' command. Aborting for safety."
+    return 0
+  fi
+
+  info "Running login command..."
+  if ! eval "$pasted_cmd"; then
+    error "Login command failed. Please check the pasted command and try again."
+    return 0
+  fi
+
+  success "Login successful."
+
+  # Determine the newly active context.
+  local current_ctx
+  if ! current_ctx="$(oc config current-context 2>/dev/null)"; then
+    error "Login succeeded but could not determine the current context. Skipping rename step."
+    return 0
+  fi
+
+  # Remove any pre-existing context with the target short name to avoid clashes.
+  if oc config get-contexts -o name 2>/dev/null | grep -qx "$short_name"; then
+    if [[ "$current_ctx" != "$short_name" ]]; then
+      info "Removing old '$short_name' context..."
+      if ! oc config delete-context "$short_name" >/dev/null 2>&1; then
+        warn "Could not remove the existing '$short_name' context. Continuing anyway."
+      fi
+    fi
+  fi
+
+  if [[ "$current_ctx" == "$short_name" ]]; then
+    success "Context is already named '$short_name'. Nothing to rename."
+    return 0
+  fi
+
+  info "Renaming context '$current_ctx' to '$short_name'..."
+  if oc config rename-context "$current_ctx" "$short_name" >/dev/null 2>&1; then
+    success "Context renamed to '$short_name'."
+  else
+    error "Failed to rename context '$current_ctx' to '$short_name'."
+  fi
+}
+
+# --------------------------------------------------------------------------
+# Feature: Current Status
+# --------------------------------------------------------------------------
+
+show_status() {
+  heading "Current Status"
+
+  local current_ctx current_user
+
+  if current_ctx="$(oc config current-context 2>/dev/null)"; then
+    info "Active context: ${COLOR_BOLD}${current_ctx}${COLOR_RESET}"
+  else
+    warn "No active context set."
+  fi
+
+  if current_user="$(oc whoami 2>/dev/null)"; then
+    info "Logged in as:   ${COLOR_BOLD}${current_user}${COLOR_RESET}"
+  else
+    warn "Not currently logged in (or token expired)."
+  fi
+}
+
+# --------------------------------------------------------------------------
+# Feature: Rename Context
+# --------------------------------------------------------------------------
+
+rename_context() {
+  load_contexts || return 0
+
+  interactive_menu "Rename Context - select a context:" "${CONTEXTS[@]}" || { warn "Cancelled."; return 0; }
+  local old_name="${CONTEXTS[$MENU_SELECTED_INDEX]}"
+
+  local new_name
+  read -r -p "$(printf '%sEnter the new name for "%s": %s' "${COLOR_INFO}" "$old_name" "${COLOR_RESET}")" new_name
+
+  if [[ -z "$new_name" ]]; then
+    warn "Empty name entered. Aborting rename."
+    return 0
+  fi
+
+  if oc config rename-context "$old_name" "$new_name" >/dev/null 2>&1; then
+    success "Renamed context '$old_name' to '$new_name'."
+  else
+    error "Failed to rename context '$old_name' to '$new_name'."
+  fi
+}
+
+# --------------------------------------------------------------------------
+# Feature: Disconnect / Clean up (remove context)
+# --------------------------------------------------------------------------
+
+delete_context() {
+  load_contexts || return 0
+
+  local active_ctx
+  active_ctx="$(oc config current-context 2>/dev/null || true)"
+
+  interactive_menu "Disconnect / Clean up - select a context to delete:" "${CONTEXTS[@]}" || { warn "Cancelled."; return 0; }
+  local target="${CONTEXTS[$MENU_SELECTED_INDEX]}"
+
+  if oc config delete-context "$target" >/dev/null 2>&1; then
+    success "Deleted context: $target"
+    if [[ -n "$active_ctx" && "$target" == "$active_ctx" ]]; then
+      warn "Warning: '$target' was the active context. You have no active context now."
+      warn "Use 'Switch Environment' to select a new one."
+    fi
+  else
+    error "Failed to delete context: $target"
+  fi
+}
+
+# --------------------------------------------------------------------------
+# Installation
+# --------------------------------------------------------------------------
+
+install_self() {
+  heading "Installing $SCRIPT_NAME"
+
+  local target_dir target_path
+
+  if [[ -d "$HOME/.local/bin" ]] || mkdir -p "$HOME/.local/bin" 2>/dev/null; then
+    target_dir="$HOME/.local/bin"
+  else
+    target_dir="/usr/local/bin"
+  fi
+
+  target_path="$target_dir/$SCRIPT_NAME"
+
+  chmod +x "$SCRIPT_PATH" 2>/dev/null || true
+
+  if [[ -w "$target_dir" ]]; then
+    ln -sf "$SCRIPT_PATH" "$target_path"
+  else
+    info "Elevated permissions required to write to $target_dir"
+    sudo ln -sf "$SCRIPT_PATH" "$target_path"
+  fi
+
+  success "Installed: $target_path -> $SCRIPT_PATH"
+
+  case ":$PATH:" in
+    *":$target_dir:"*)
+      info "You're all set. Run '$SCRIPT_NAME' from anywhere."
+      ;;
+    *)
+      warn "$target_dir is not on your PATH."
+      warn "Add this line to your shell profile (~/.bashrc, ~/.zshrc, etc.):"
+      warn "  export PATH=\"$target_dir:\$PATH\""
+      ;;
+  esac
+}
+
+# Removes any symlink previously created by install_self(), but only if it
+# actually points back at this script. Never touches unrelated files, the
+# oc kubeconfig, or any oc contexts.
+uninstall_self() {
+  heading "Uninstalling $SCRIPT_NAME"
+
+  local candidate_dirs=("$HOME/.local/bin" "/usr/local/bin")
+  local removed_any=0
+  local dir candidate link_target
+
+  for dir in "${candidate_dirs[@]}"; do
+    candidate="$dir/$SCRIPT_NAME"
+
+    [[ -e "$candidate" || -L "$candidate" ]] || continue
+
+    if [[ -L "$candidate" ]]; then
+      link_target="$(readlink "$candidate")"
+      if [[ "$link_target" != "$SCRIPT_PATH" ]]; then
+        warn "Skipping $candidate: it does not point to this repo's '$SCRIPT_NAME' script (points to '$link_target')."
+        continue
+      fi
+    else
+      warn "Skipping $candidate: it is a regular file, not a symlink created by this installer."
+      continue
+    fi
+
+    if [[ -w "$dir" ]]; then
+      rm -f "$candidate"
+    else
+      info "Elevated permissions required to remove $candidate"
+      sudo rm -f "$candidate"
+    fi
+
+    success "Removed: $candidate"
+    removed_any=1
+  done
+
+  if [[ "$removed_any" -eq 0 ]]; then
+    warn "Nothing to uninstall: no '$SCRIPT_NAME' wizard symlink found in ${candidate_dirs[*]}."
+  else
+    info "Uninstall complete. The repository files themselves were left untouched."
+  fi
+}
+
+# --------------------------------------------------------------------------
+# Main menu
+# --------------------------------------------------------------------------
+
+main_menu() {
+  local options=(
+    "Switch Environment (Select Context)"
+    "Switch Project (Select Namespace)"
+    "Login (Fetch new token & Setup)"
+    "Current Status"
+    "Rename Context"
+    "Disconnect / Clean up (Remove Context)"
+    "Exit"
+  )
+
+  while true; do
+    echo
+    if ! interactive_menu "OpenShift CLI Wizard" "${options[@]}"; then
+      info "Goodbye."
+      exit 0
+    fi
+
+    case "$MENU_SELECTED_INDEX" in
+      0) switch_context ;;
+      1) switch_project ;;
+      2) login_flow ;;
+      3) show_status ;;
+      4) rename_context ;;
+      5) delete_context ;;
+      6) info "Goodbye."; exit 0 ;;
+    esac
+  done
+}
+
+# --------------------------------------------------------------------------
+# Entrypoint
+# --------------------------------------------------------------------------
+
+main() {
+  case "${1:-}" in
+    --install)
+      install_self
+      exit 0
+      ;;
+    --uninstall)
+      uninstall_self
+      exit 0
+      ;;
+    --help|-h)
+      printf '%s\n' "Usage: $SCRIPT_NAME [--install|--uninstall|--help]"
+      printf '%s\n' "Run without arguments to launch the interactive wizard."
+      exit 0
+      ;;
+  esac
+
+  check_prereqs
+
+  # Global Ctrl+C handler: always restore the terminal (raw mode + hidden
+  # cursor, in case Ctrl+C landed mid-way through an interactive_menu
+  # render) before exiting.
+  trap '[[ -n "$SAVED_STTY" ]] && stty "$SAVED_STTY" 2>/dev/null; tput cnorm 2>/dev/null; echo; warn "Cancelled by user."; exit 130' INT
+
+  main_menu
+}
+
+main "$@"
