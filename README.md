@@ -47,11 +47,22 @@ openshift --help
 
 ## Usage
 
-Run without arguments to launch the interactive menu:
+Run without arguments to launch the interactive wizard:
 
 ```bash
 openshift
 ```
+
+The wizard takes over the full screen (like `vim`/`htop`/`less`) for the
+whole session. Every menu and action result renders in place — nothing
+stacks up or scrolls, and once you exit (via `Exit`, `q`, `Esc`, or
+`Ctrl+C`) your terminal is restored to exactly what it looked like before,
+with nothing from the session left in your scrollback.
+
+On startup, it runs a quick preliminary check (`oc whoami`) against your
+current context and warns you up front if your session token looks
+invalid or expired, so you find out before hitting confusing failures
+deeper in the wizard.
 
 ### Controls
 
@@ -65,13 +76,18 @@ choice) is navigated the same way:
 | `←`, `q`, `Esc`      | Cancel / go back    |
 | `Ctrl+C`             | Exit the wizard     |
 
+After an action runs, its result is shown and the wizard waits for
+`Enter` ("Press Enter to continue...") before clearing the screen and
+returning to the menu, so results stay readable.
+
 ### Menu options
 
 1. **Switch Environment (Select Context)** — lists all `oc` contexts and
    switches to the one you pick.
 2. **Switch Project (Select Namespace)** — lists all projects/namespaces
-   you can access on the current context and switches to the one you pick
-   (`oc project <name>`).
+   you can access on the current context and switches to the one you pick,
+   updating the current context's namespace in place
+   (`oc config set-context --current --namespace=<name>`).
 3. **Login (Fetch new token & Setup)** — choose `DEV` or `PROD`, the
    wizard opens the corresponding token page in your browser, you paste
    the `oc login ...` command it gives you, and the wizard:
