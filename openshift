@@ -311,7 +311,15 @@ switch_project() {
   interactive_menu "Switch Project - select a namespace:" "${projects[@]}" || { warn "Cancelled."; return 0; }
   local target="${projects[$MENU_SELECTED_INDEX]}"
 
-  if oc project "$target" >/dev/null 2>&1; then
+  # Deliberately NOT using `oc project <name>` here: unlike
+  # `kubectl config set-context --current --namespace=...`, OpenShift's
+  # `oc project` creates a brand-new auto-named context
+  # (<namespace>/<cluster>/<user>) and switches current-context to that
+  # new entry instead of updating the existing one in place -- silently
+  # leaving the user's nicely-named context (e.g. "prod") behind as an
+  # abandoned duplicate. `oc config set-context` only edits the current
+  # context's namespace field, with no such side effect.
+  if oc config set-context --current --namespace="$target" >/dev/null 2>&1; then
     local current_ctx
     current_ctx="$(oc config current-context 2>/dev/null || echo "unknown")"
     success "Switched to project '$target' on context '$current_ctx'."
