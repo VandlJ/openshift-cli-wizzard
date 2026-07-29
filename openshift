@@ -32,9 +32,21 @@ readonly PROD_LOGIN_URL="https://oauth-openshift.apps.ocp.cc.corp/oauth/token/di
 # Populated by check_prereqs()
 OPEN_CMD=""
 
+# Populated by check_prereqs(). Unlike `oc`, a missing `k9s` binary is not
+# fatal -- it's an optional companion tool, so the wizard just remembers
+# whether it's available and warns the user instead of exiting.
+K9S_AVAILABLE=0
+
 # Populated by interactive_menu() while it has the terminal in raw mode, so
 # the global Ctrl+C trap can restore it if the user bails out mid-menu.
 SAVED_STTY=""
+
+# Optional extra banner line rendered by interactive_menu() right below the
+# title, in the warning color (e.g. "k9s is not installed"). A caller sets
+# this immediately before invoking interactive_menu() for the one render it
+# should appear on; interactive_menu() clears it again once that call is
+# done, so it never leaks into an unrelated submenu that didn't set it.
+MENU_BANNER=""
 
 # --------------------------------------------------------------------------
 # UI helpers (brand color palette, with a safe fallback when not a TTY)
@@ -122,6 +134,16 @@ check_prereqs() {
   else
     error "Error: no browser-opening utility found (need 'open' on macOS or 'xdg-open' on Linux)."
     missing=1
+  fi
+
+  # k9s is an optional companion tool (a terminal UI for Kubernetes), not
+  # a hard requirement -- if it's missing we just remember that and let
+  # the main menu show a non-fatal warning, instead of exiting like we do
+  # for the checks above.
+  if command -v k9s >/dev/null 2>&1; then
+    K9S_AVAILABLE=1
+  else
+    K9S_AVAILABLE=0
   fi
 
   if [[ "$missing" -ne 0 ]]; then
@@ -218,6 +240,9 @@ interactive_menu() {
   _menu_render() {
     lines_printed=0
     _menu_draw_line "${COLOR_BOLD}${COLOR_BRAND}${title}${COLOR_RESET}"
+    if [[ -n "$MENU_BANNER" ]]; then
+      _menu_draw_line "${COLOR_WARN}${MENU_BANNER}${COLOR_RESET}"
+    fi
     local i
     for i in "${!options[@]}"; do
       if [[ "$i" -eq "$selected" ]]; then
@@ -310,6 +335,11 @@ interactive_menu() {
   fi
   tput cnorm 2>/dev/null
 
+  # Clear the banner now that this render is done, so it doesn't leak into
+  # whatever interactive_menu() call happens next (e.g. a submenu picker)
+  # unless that caller explicitly sets it again.
+  MENU_BANNER=""
+
   [[ "$MENU_SELECTED_INDEX" -ge 0 ]]
 }
 
@@ -369,6 +399,43 @@ switch_project() {
   else
     error "Failed to switch to project: $target"
   fi
+}
+
+# --------------------------------------------------------------------------
+# Feature: Launch k9s Dashboard
+# --------------------------------------------------------------------------
+
+launch_k9s() {
+  if [[ "$K9S_AVAILABLE" -ne 1 ]]; then
+    error "'k9s' is not installed."
+    error "Install it (e.g. 'brew install k9s' on macOS, or see https://k9scli.io/topics/install/) and try again."
+    return 0
+  fi
+
+  local current_ctx
+  if ! current_ctx="$(oc config current-context 2>/dev/null)"; then
+    error "No active context set. Use 'Switch Environment' or 'Login' first."
+    return 0
+  fi
+
+  # k9s is itself a full-screen terminal UI, so we run it directly in the
+  # foreground and let it take over the terminal exactly like any other
+  # interactive CLI tool -- the wizard just waits here until the user
+  # quits it (":q"). It already picks up the active context/namespace
+  # from ~/.kube/config on its own, but --context is passed explicitly to
+  # be safe regardless of what k9s's own defaulting does.
+  k9s --context "$current_ctx"
+
+  # k9s manages its own alternate screen and restores the terminal when it
+  # quits, but clear explicitly anyway so no stray remnants (e.g. from an
+  # abrupt k9s crash) bleed into the wizard's next render.
+  tput clear 2>/dev/null
+
+  # Return 1 (skip the "Press Enter to continue" pause): the user already
+  # spent an entire separate interactive session inside k9s and explicitly
+  # quit it, so pausing again here would be a redundant extra keypress,
+  # same reasoning as skipping the pause after a plain menu cancellation.
+  return 1
 }
 
 # --------------------------------------------------------------------------
@@ -616,6 +683,7 @@ main_menu() {
   local options=(
     "Switch Environment (Select Context)"
     "Switch Project (Select Namespace)"
+    "Launch k9s Dashboard"
     "Login (Fetch new token & Setup)"
     "Current Status"
     "Rename Context"
@@ -627,6 +695,14 @@ main_menu() {
 
   while true; do
     tput clear 2>/dev/null
+
+    # Shown only on this exact render: interactive_menu() clears
+    # MENU_BANNER again once it returns, so it never leaks into a
+    # submenu picker (e.g. Switch Environment's context list).
+    if [[ "$K9S_AVAILABLE" -ne 1 ]]; then
+      MENU_BANNER="Warning: 'k9s' is not installed. We recommend installing it for a better cluster UI experience."
+    fi
+
     if ! interactive_menu "OpenShift CLI Wizard" "${options[@]}"; then
       exit_wizard
     fi
@@ -640,11 +716,12 @@ main_menu() {
     case "$MENU_SELECTED_INDEX" in
       0) switch_context && pause_for_key ;;
       1) switch_project && pause_for_key ;;
-      2) login_flow && pause_for_key ;;
-      3) show_status && pause_for_key ;;
-      4) rename_context && pause_for_key ;;
-      5) delete_context && pause_for_key ;;
-      6) exit_wizard ;;
+      2) launch_k9s && pause_for_key ;;
+      3) login_flow && pause_for_key ;;
+      4) show_status && pause_for_key ;;
+      5) rename_context && pause_for_key ;;
+      6) delete_context && pause_for_key ;;
+      7) exit_wizard ;;
     esac
   done
 }

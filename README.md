@@ -16,6 +16,12 @@ no `fzf`). Works on both macOS and Linux out of the box.
 The wizard checks both at startup and exits with a clear error message if
 either is missing.
 
+- [`k9s`](https://k9scli.io/) (optional) — a terminal UI for Kubernetes/OpenShift clusters.
+  If it's missing, the wizard does **not** exit; it just shows a warning at
+  the top of the main menu recommending you install it (e.g.
+  `brew install k9s`), and the "Launch k9s Dashboard" menu option will show
+  an error if you select it without k9s installed.
+
 ## Installation
 
 Two equivalent ways to install:
@@ -88,17 +94,23 @@ returning to the menu, so results stay readable.
    you can access on the current context and switches to the one you pick,
    updating the current context's namespace in place
    (`oc config set-context --current --namespace=<name>`).
-3. **Login (Fetch new token & Setup)** — choose `DEV` or `PROD`, the
+3. **Launch k9s Dashboard** — launches [`k9s`](https://k9scli.io/) against
+   your current context (`k9s --context <current-context>`), taking over
+   the terminal for a full cluster dashboard session. When you quit k9s
+   (`:q`), you're dropped straight back into the wizard's main menu with
+   no extra confirmation needed. If k9s isn't installed, shows an error
+   with install instructions instead.
+4. **Login (Fetch new token & Setup)** — choose `DEV` or `PROD`, the
    wizard opens the corresponding token page in your browser, you paste
    the `oc login ...` command it gives you, and the wizard:
    - runs it,
    - removes any stale `dev`/`prod` context,
    - renames the freshly created context to `dev` or `prod`.
-4. **Current Status** — shows the active context and the logged-in user.
-5. **Rename Context** — pick a context and give it a new name.
-6. **Disconnect / Clean up (Remove Context)** — pick a context and delete
+5. **Current Status** — shows the active context and the logged-in user.
+6. **Rename Context** — pick a context and give it a new name.
+7. **Disconnect / Clean up (Remove Context)** — pick a context and delete
    it. Warns you if you just deleted the active context.
-7. **Exit** — quits the wizard.
+8. **Exit** — quits the wizard.
 
 Press `Ctrl+C`, `q`, or `Esc` at any point to cancel the current prompt or
 exit the wizard cleanly.
