@@ -69,17 +69,20 @@ choice) is navigated the same way:
 
 1. **Switch Environment (Select Context)** — lists all `oc` contexts and
    switches to the one you pick.
-2. **Login (Fetch new token & Setup)** — choose `DEV` or `PROD`, the
+2. **Switch Project (Select Namespace)** — lists all projects/namespaces
+   you can access on the current context and switches to the one you pick
+   (`oc project <name>`).
+3. **Login (Fetch new token & Setup)** — choose `DEV` or `PROD`, the
    wizard opens the corresponding token page in your browser, you paste
    the `oc login ...` command it gives you, and the wizard:
    - runs it,
    - removes any stale `dev`/`prod` context,
    - renames the freshly created context to `dev` or `prod`.
-3. **Current Status** — shows the active context and the logged-in user.
-4. **Rename Context** — pick a context and give it a new name.
-5. **Disconnect / Clean up (Remove Context)** — pick a context and delete
+4. **Current Status** — shows the active context and the logged-in user.
+5. **Rename Context** — pick a context and give it a new name.
+6. **Disconnect / Clean up (Remove Context)** — pick a context and delete
    it. Warns you if you just deleted the active context.
-6. **Exit** — quits the wizard.
+7. **Exit** — quits the wizard.
 
 Press `Ctrl+C`, `q`, or `Esc` at any point to cancel the current prompt or
 exit the wizard cleanly.
